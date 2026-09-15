@@ -78,7 +78,7 @@ h1, h2, h3, p { margin-top: 0; }
 .server-card > span { color: #9aa2b0; }
 .server-card .pulse-dot { width: 6px; height: 6px; box-shadow: none; }
 .workspace { min-width: 0; }
-.topbar { display: flex; min-height: 92px; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--line); padding: 18px clamp(24px, 4vw, 56px); background: rgb(255 255 255 / 88%); backdrop-filter: blur(12px); }
+.topbar { position: sticky; z-index: 10; top: 0; display: flex; min-height: 92px; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--line); padding: 18px clamp(24px, 4vw, 56px); background: rgb(255 255 255 / 94%); box-shadow: 0 4px 16px rgb(16 24 40 / 4%); backdrop-filter: blur(12px); }
 .topbar .page-kicker { margin-bottom: 2px; letter-spacing: .08em; }
 .topbar h1 { margin: 0; font-size: 23px; letter-spacing: -.03em; }
 .account-menu { display: flex; align-items: center; gap: 10px; }
