@@ -24,6 +24,7 @@ export default function AdminPage() {
   const [currentUserName, setCurrentUserName] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [createDialogOpen, setCreateDialogOpen] = useState(false);
 
   useEffect(() => setToken(localStorage.getItem("rustdesk_admin_token") ?? ""), []);
 
@@ -91,6 +92,7 @@ export default function AdminPage() {
         }),
       }));
       formElement.reset();
+      setCreateDialogOpen(false);
       setMessage(token ? "账号创建成功" : "首个管理员已创建，请登录");
       await loadUsers();
     } catch (error) {
@@ -219,6 +221,7 @@ export default function AdminPage() {
 
           <div className="dashboard-grid">
             <section className="panel users-panel">
+              <button className="secondary-button create-account-button" type="button" disabled={loading} onClick={() => setCreateDialogOpen(true)}>创建账号</button>
               <div className="panel-header">
                 <div><h2>团队账号</h2><p>管理账号状态、角色和登录密码</p></div>
                 <button className="icon-button" aria-label="刷新账号列表" title="刷新" disabled={loading} onClick={() => void loadUsers()}>↻</button>
@@ -272,6 +275,34 @@ export default function AdminPage() {
           </div>
         </div>
       </div>
+
+      {createDialogOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreateDialogOpen(false); }}>
+          <section className="modal-card" role="dialog" aria-modal="true" aria-labelledby="create-account-title">
+            <div className="modal-header">
+              <div><span className="section-kicker">账号管理</span><h2 id="create-account-title">创建新账号</h2></div>
+              <button className="modal-close" type="button" aria-label="关闭" onClick={() => setCreateDialogOpen(false)}>×</button>
+            </div>
+            <p className="modal-description">创建一个可以登录 RustDesk 服务的账号。</p>
+            <form className="form" onSubmit={createUser}>
+              <label>用户名<input name="newUsername" minLength={3} autoComplete="off" placeholder="例如 zhangsan" required /></label>
+              <label>初始密码<input name="newPassword" type="password" minLength={10} autoComplete="new-password" placeholder="至少 10 位" required /></label>
+              <div className="field-row">
+                <label>显示名称<input name="displayName" autoComplete="off" placeholder="选填" /></label>
+                <label>邮箱<input name="email" type="email" autoComplete="off" placeholder="name@example.com" /></label>
+              </div>
+              <label className="switch-row">
+                <span><strong>管理员权限</strong><small>可管理所有账号和设备</small></span>
+                <input name="isAdmin" type="checkbox" />
+              </label>
+              <div className="modal-actions">
+                <button className="secondary-button" type="button" disabled={loading} onClick={() => setCreateDialogOpen(false)}>取消</button>
+                <button className="primary" type="submit" disabled={loading}>{loading ? "处理中…" : "创建账号"}</button>
+              </div>
+            </form>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
