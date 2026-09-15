@@ -1,0 +1,4 @@
+https://{$ACCOUNT_HOSTNAME}:21120 {
+  encode zstd gzip
+  reverse_proxy account-api:3000
+}

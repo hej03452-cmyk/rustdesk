@@ -1,0 +1,290 @@
+diff --git a/src/account_auth.rs b/src/account_auth.rs
+new file mode 100644
+index 0000000..83a4ad8
+--- /dev/null
++++ b/src/account_auth.rs
+@@ -0,0 +1,101 @@
++use crate::common::get_arg;
++use hbb_common::{
++    anyhow::{anyhow, Context},
++    log, timeout, ResultType,
++};
++use serde_derive::{Deserialize, Serialize};
++
++const AUTH_TIMEOUT: u64 = 3_000;
++
++#[derive(Serialize)]
++struct AuthorizationRequest<'a> {
++    token: &'a str,
++    target_id: &'a str,
++}
++
++#[derive(Deserialize)]
++struct AuthorizationResponse {
++    allowed: bool,
++    reason: Option<String>,
++}
++
++#[derive(Clone)]
++pub struct AccountAuth {
++    client: reqwest::Client,
++    url: String,
++    secret: String,
++    allow_anonymous: bool,
++}
++
++impl AccountAuth {
++    pub fn from_env() -> ResultType<Self> {
++        Ok(Self {
++            client: reqwest::Client::builder().no_proxy().build()?,
++            url: get_arg("rendezvous-auth-url"),
++            secret: get_arg("rendezvous-auth-secret"),
++            allow_anonymous: matches!(
++                get_arg("rendezvous-allow-anonymous")
++                    .to_ascii_lowercase()
++                    .as_str(),
++                "1" | "true" | "y" | "yes"
++            ),
++        })
++    }
++
++    pub async fn authorize(&self, token: &str, target_id: &str) -> Result<(), String> {
++        if token.is_empty() {
++            return if self.allow_anonymous {
++                Ok(())
++            } else {
++                Err("Account login is required".to_owned())
++            };
++        }
++        self.authorize_account(token, target_id)
++            .await
++            .map_err(|err| {
++                log::warn!(
++                    "Account authorization failed for target {}: {}",
++                    target_id,
++                    err
++                );
++                "Account authorization service is unavailable".to_owned()
++            })?
++    }
++
++    async fn authorize_account(
++        &self,
++        token: &str,
++        target_id: &str,
++    ) -> ResultType<Result<(), String>> {
++        if self.url.is_empty() || self.secret.is_empty() {
++            return Err(anyhow!("account authorization is not configured"));
++        }
++        let response = timeout(
++            AUTH_TIMEOUT,
++            self.client
++                .post(&self.url)
++                .bearer_auth(&self.secret)
++                .json(&AuthorizationRequest { token, target_id })
++                .send(),
++        )
++        .await
++        .context("account authorization timed out")??;
++        if !response.status().is_success() {
++            return Err(anyhow!(
++                "account authorization returned {}",
++                response.status()
++            ));
++        }
++        let response = response
++            .json::<AuthorizationResponse>()
++            .await
++            .context("invalid account authorization response")?;
++        if response.allowed {
++            Ok(Ok(()))
++        } else {
++            Ok(Err(response
++                .reason
++                .unwrap_or_else(|| "Account access denied".to_owned())))
++        }
++    }
++}
+diff --git a/src/lib.rs b/src/lib.rs
+index 8da29a2..0f6f218 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,5 +1,6 @@
+ mod rendezvous_server;
+ pub use rendezvous_server::*;
++mod account_auth;
+ pub mod common;
+ mod database;
+ mod peer;
+diff --git a/src/rendezvous_server.rs b/src/rendezvous_server.rs
+index eaf7190..d58666f 100644
+--- a/src/rendezvous_server.rs
++++ b/src/rendezvous_server.rs
+@@ -1,3 +1,4 @@
++use crate::account_auth::AccountAuth;
+ use crate::common::*;
+ use crate::peer::*;
+ use hbb_common::{
+@@ -16,7 +17,7 @@ use hbb_common::{
+         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
+         *,
+     },
+-    tcp::FramedStream,
++    tcp::{DynTcpStream, Encrypt, FramedStream},
+     timeout,
+     tokio::{
+         self,
+@@ -31,7 +32,7 @@ use hbb_common::{
+     AddrMangle, ResultType,
+ };
+ use ipnetwork::Ipv4Network;
+-use sodiumoxide::crypto::sign;
++use sodiumoxide::crypto::{box_, sign};
+ use std::{
+     collections::HashMap,
+     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+@@ -48,10 +49,14 @@ enum Data {
+ }
+ 
+ const REG_TIMEOUT: i64 = 30_000;
+-type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
++type TcpStreamSink = SplitSink<Framed<DynTcpStream, BytesCodec>, Bytes>;
+ type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
++struct SecureTcpSink {
++    sink: TcpStreamSink,
++    encrypt: Option<Encrypt>,
++}
+ enum Sink {
+-    TcpStream(TcpStreamSink),
++    TcpStream(SecureTcpSink),
+     Ws(WsSink),
+ }
+ type Sender = mpsc::UnboundedSender<Data>;
+@@ -88,6 +93,7 @@ pub struct RendezvousServer {
+     relay_servers0: Arc<RelayServers>,
+     rendezvous_servers: Arc<Vec<String>>,
+     inner: Arc<Inner>,
++    account_auth: Arc<AccountAuth>,
+ }
+ 
+ enum LoopFailure {
+@@ -150,6 +156,7 @@ impl RendezvousServer {
+                 mask,
+                 local_ip,
+             }),
++            account_auth: Arc::new(AccountAuth::from_env()?),
+         };
+         log::info!("mask: {:?}", rs.inner.mask);
+         log::info!("local-ip: {:?}", rs.inner.local_ip);
+@@ -511,7 +518,17 @@ impl RendezvousServer {
+     ) -> bool {
+         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
+             match msg_in.union {
+-                Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
++                Some(rendezvous_message::Union::PunchHoleRequest(mut ph)) => {
++                    if let Err(reason) = self.account_auth.authorize(&ph.token, &ph.id).await {
++                        let mut response = RendezvousMessage::new();
++                        response.set_punch_hole_response(PunchHoleResponse {
++                            other_failure: reason,
++                            ..Default::default()
++                        });
++                        Self::send_to_sink(sink, response).await;
++                        return false;
++                    }
++                    ph.token.clear();
+                     // there maybe several attempt, so sink can be none
+                     if let Some(sink) = sink.take() {
+                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+@@ -520,6 +537,16 @@ impl RendezvousServer {
+                     return true;
+                 }
+                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
++                    if let Err(reason) = self.account_auth.authorize(&rf.token, &rf.id).await {
++                        let mut response = RendezvousMessage::new();
++                        response.set_relay_response(RelayResponse {
++                            refuse_reason: reason,
++                            ..Default::default()
++                        });
++                        Self::send_to_sink(sink, response).await;
++                        return false;
++                    }
++                    rf.token.clear();
+                     // there maybe several attempt, so sink can be none
+                     if let Some(sink) = sink.take() {
+                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+@@ -853,7 +880,12 @@ impl RendezvousServer {
+             if let Ok(bytes) = msg.write_to_bytes() {
+                 match sink {
+                     Sink::TcpStream(s) => {
+-                        allow_err!(s.send(Bytes::from(bytes)).await);
++                        let bytes = if let Some(encrypt) = s.encrypt.as_mut() {
++                            encrypt.enc(&bytes)
++                        } else {
++                            bytes
++                        };
++                        allow_err!(s.sink.send(Bytes::from(bytes)).await);
+                     }
+                     Sink::Ws(ws) => {
+                         allow_err!(ws.send(tungstenite::Message::Binary(bytes)).await);
+@@ -1215,9 +1247,20 @@ impl RendezvousServer {
+                 }
+             }
+         } else {
+-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+-            sink = Some(Sink::TcpStream(a));
+-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
++            let mut stream = FramedStream::from(stream, addr);
++            let (first, encrypt) = self.begin_tcp_session(&mut stream).await?;
++            let (a, mut b) = stream.0.split();
++            let mut decrypt = encrypt.clone();
++            sink = Some(Sink::TcpStream(SecureTcpSink { sink: a, encrypt }));
++            if let Some(bytes) = first {
++                if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
++                    return Ok(());
++                }
++            }
++            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
++                if let Some(decrypt) = decrypt.as_mut() {
++                    decrypt.dec(&mut bytes)?;
++                }
+                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
+                     break;
+                 }
+@@ -1230,6 +1273,37 @@ impl RendezvousServer {
+         Ok(())
+     }
+ 
++    async fn begin_tcp_session(
++        &self,
++        stream: &mut FramedStream,
++    ) -> ResultType<(Option<BytesMut>, Option<Encrypt>)> {
++        let Some(server_sk) = self.inner.sk.as_ref() else {
++            return Ok((stream.next_timeout(30_000).await.transpose()?, None));
++        };
++        let (public_key, secret_key) = box_::gen_keypair();
++        let mut message = RendezvousMessage::new();
++        message.set_key_exchange(KeyExchange {
++            keys: vec![sign::sign(&public_key.0, server_sk).into()],
++            ..Default::default()
++        });
++        stream.send(&message).await?;
++
++        let Some(bytes) = stream.next_timeout(30_000).await.transpose()? else {
++            return Ok((None, None));
++        };
++        let Ok(message) = RendezvousMessage::parse_from_bytes(&bytes) else {
++            return Ok((Some(bytes), None));
++        };
++        let Some(rendezvous_message::Union::KeyExchange(exchange)) = message.union else {
++            return Ok((Some(bytes), None));
++        };
++        if exchange.keys.len() != 2 {
++            bail!("Handshake failed: invalid key exchange message");
++        }
++        let key = Encrypt::decode(&exchange.keys[1], &exchange.keys[0], &secret_key)?;
++        Ok((None, Some(Encrypt::new(key))))
++    }
++
+     #[inline]
+     async fn get_pk(&mut self, version: &str, id: String) -> Bytes {
+         if version.is_empty() || self.inner.sk.is_none() {

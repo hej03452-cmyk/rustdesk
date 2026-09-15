@@ -1,0 +1,100 @@
+services:
+  hbbs:
+    build:
+      context: .
+      dockerfile: rustdesk-server-auth/Dockerfile
+    container_name: rustdesk-hbbs
+    # For a client on this same machine, 127.0.0.1 is the correct advertised relay address.
+    # Override RUSTDESK_RELAY_HOST with the host's LAN/public address for other clients.
+    command: -r ${RUSTDESK_RELAY_HOST:-127.0.0.1}:21117
+    volumes:
+      - ./docker-data/hbbs:/root
+    environment:
+      RENDEZVOUS_AUTH_URL: http://account-api:3000/api/internal/rendezvous/authorize
+      RENDEZVOUS_AUTH_SECRET: ${RENDEZVOUS_AUTH_SECRET}
+      RENDEZVOUS_ALLOW_ANONYMOUS: ${RENDEZVOUS_ALLOW_ANONYMOUS:-true}
+    ports:
+      - "21114:21114/tcp"
+      - "21115:21115/tcp"
+      - "21116:21116/tcp"
+      - "21116:21116/udp"
+      - "21118:21118/tcp"
+    depends_on:
+      - hbbr
+    restart: unless-stopped
+
+  hbbr:
+    image: rustdesk/rustdesk-server:latest
+    container_name: rustdesk-hbbr
+    command: hbbr
+    volumes:
+      - ./docker-data/hbbr:/root
+    ports:
+      - "21117:21117/tcp"
+      - "21119:21119/tcp"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: rustdesk-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rustdesk}
+      POSTGRES_USER: ${POSTGRES_USER:-rustdesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+    volumes:
+      - ./docker-data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+    profiles:
+      - account
+
+  account-api:
+    build: ./account-server
+    container_name: rustdesk-account-api
+    environment:
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-rustdesk}
+      PGUSER: ${POSTGRES_USER:-rustdesk}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      ACCOUNT_BOOTSTRAP_TOKEN: ${ACCOUNT_BOOTSTRAP_TOKEN:-}
+      ACCOUNT_SESSION_TTL_DAYS: ${ACCOUNT_SESSION_TTL_DAYS:-30}
+      ACCOUNT_ALLOW_REGISTRATION: ${ACCOUNT_ALLOW_REGISTRATION:-false}
+      RENDEZVOUS_AUTH_SECRET: ${RENDEZVOUS_AUTH_SECRET}
+      RENDEZVOUS_AUTH_POLICY: ${RENDEZVOUS_AUTH_POLICY:-same-account}
+    expose:
+      - "3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    profiles:
+      - account
+
+  account-proxy:
+    image: caddy:2-alpine
+    container_name: rustdesk-account-proxy
+    environment:
+      ACCOUNT_HOSTNAME: ${ACCOUNT_HOSTNAME:-207.148.14.169.sslip.io}
+    ports:
+      - "80:80/tcp"
+      - "21120:21120/tcp"
+    volumes:
+      - ./account-server/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./docker-data/caddy/data:/data
+      - ./docker-data/caddy/config:/config
+    depends_on:
+      account-api:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - account
